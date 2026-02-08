@@ -1,12 +1,7 @@
 {% macro whybroken_detect_anomalies(run_id, model_name) %}
-  {#
-    Compares the current run's snapshot against the most recent previous run.
-    Flags: row count swings > 50%, average value shifts > 30%, null spikes.
-  #}
 
-  {% set wb_schema = whybroken_fq_schema() %}
+  {% set wb_schema = whybroken.whybroken_fq_schema() %}
 
-  {# Find previous run for this model #}
   {% set prev_query %}
     SELECT run_id FROM {{ wb_schema }}.whybroken_snapshots
     WHERE model_name = '{{ model_name }}'
@@ -57,7 +52,7 @@
           '{{ rrow[0] }}',
           '{{ rrow[1] }}',
           {{ delta }},
-          {{ whybroken_current_timestamp() }}
+          {{ whybroken.whybroken_current_timestamp() }}
         )
       {% endset %}
       {% do run_query(insert_anomaly) %}
@@ -91,7 +86,6 @@
   {% for srow in stat_result.rows %}
     {% set delta = srow[3] | float %}
 
-    {# Average value shift #}
     {% if delta > 30 or delta < -30 %}
       {% set severity = 'critical' if (delta > 80 or delta < -80) else 'high' if (delta > 50 or delta < -50) else 'medium' %}
       {% set insert_anomaly %}
@@ -106,13 +100,12 @@
           '{{ srow[1] }}',
           '{{ srow[2] }}',
           {{ delta }},
-          {{ whybroken_current_timestamp() }}
+          {{ whybroken.whybroken_current_timestamp() }}
         )
       {% endset %}
       {% do run_query(insert_anomaly) %}
     {% endif %}
 
-    {# Null spike #}
     {% set curr_nulls = srow[4] | int %}
     {% set prev_nulls = srow[5] | int %}
     {% if curr_nulls > prev_nulls and (curr_nulls - prev_nulls) > 10 %}
@@ -129,7 +122,7 @@
           '{{ curr_nulls }}',
           '{{ prev_nulls }}',
           {{ null_delta }},
-          {{ whybroken_current_timestamp() }}
+          {{ whybroken.whybroken_current_timestamp() }}
         )
       {% endset %}
       {% do run_query(insert_anomaly) %}

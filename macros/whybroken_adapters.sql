@@ -1,50 +1,46 @@
 {# ------------------------------------------------------------------ #}
-{# Adapter-aware type mappings and helpers                             #}
+{# Adapter-aware type mappings                                         #}
+{# All return clean values via return() to avoid whitespace issues     #}
 {# ------------------------------------------------------------------ #}
 
 {% macro whybroken_type_string() %}
-  {% if target.type == 'bigquery' %}STRING
-  {% elif target.type == 'databricks' %}STRING
-  {% elif target.type in ('postgres', 'redshift') %}VARCHAR(4096)
-  {% elif target.type == 'snowflake' %}VARCHAR
-  {% elif target.type == 'duckdb' %}VARCHAR
-  {% else %}VARCHAR(4096)
+  {% if target.type == 'bigquery' %}{{ return('STRING') }}
+  {% elif target.type in ('databricks', 'spark') %}{{ return('STRING') }}
+  {% elif target.type in ('postgres', 'redshift') %}{{ return('VARCHAR(4096)') }}
+  {% elif target.type == 'snowflake' %}{{ return('VARCHAR') }}
+  {% else %}{{ return('VARCHAR') }}
   {% endif %}
 {% endmacro %}
 
 {% macro whybroken_type_int() %}
-  {% if target.type == 'bigquery' %}INT64
-  {% else %}INT
+  {% if target.type == 'bigquery' %}{{ return('INT64') }}
+  {% else %}{{ return('INT') }}
   {% endif %}
 {% endmacro %}
 
 {% macro whybroken_type_bigint() %}
-  {% if target.type == 'bigquery' %}INT64
-  {% else %}BIGINT
+  {% if target.type == 'bigquery' %}{{ return('INT64') }}
+  {% else %}{{ return('BIGINT') }}
   {% endif %}
 {% endmacro %}
 
 {% macro whybroken_type_float() %}
-  {% if target.type == 'bigquery' %}FLOAT64
-  {% elif target.type == 'snowflake' %}FLOAT
-  {% else %}DOUBLE
+  {% if target.type == 'bigquery' %}{{ return('FLOAT64') }}
+  {% elif target.type == 'snowflake' %}{{ return('FLOAT') }}
+  {% else %}{{ return('DOUBLE') }}
   {% endif %}
 {% endmacro %}
 
 {% macro whybroken_type_timestamp() %}
-  {% if target.type == 'bigquery' %}TIMESTAMP
-  {% elif target.type == 'snowflake' %}TIMESTAMP_NTZ
-  {% else %}TIMESTAMP
+  {% if target.type == 'snowflake' %}{{ return('TIMESTAMP_NTZ') }}
+  {% else %}{{ return('TIMESTAMP') }}
   {% endif %}
 {% endmacro %}
 
 {% macro whybroken_current_timestamp() %}
-  {% if target.type == 'bigquery' %}CURRENT_TIMESTAMP()
-  {% elif target.type == 'snowflake' %}CURRENT_TIMESTAMP()
-  {% elif target.type == 'databricks' %}CURRENT_TIMESTAMP()
-  {% elif target.type in ('postgres', 'redshift') %}NOW()
-  {% elif target.type == 'duckdb' %}CURRENT_TIMESTAMP
-  {% else %}CURRENT_TIMESTAMP
+  {% if target.type in ('postgres', 'redshift') %}{{ return('NOW()') }}
+  {% elif target.type == 'duckdb' %}{{ return('CURRENT_TIMESTAMP') }}
+  {% else %}{{ return('CURRENT_TIMESTAMP()') }}
   {% endif %}
 {% endmacro %}
 
@@ -55,7 +51,7 @@
 
 {% macro whybroken_fq_schema() %}
   {% set wb_schema = target.schema ~ '_whybroken' %}
-  {% if target.type == 'databricks' %}
+  {% if target.type in ('databricks', 'spark') %}
     {{ return(target.catalog ~ '.' ~ wb_schema) }}
   {% elif target.type == 'bigquery' %}
     {{ return(target.project ~ '.' ~ wb_schema) }}
@@ -70,11 +66,7 @@
 {# ------------------------------------------------------------------ #}
 
 {% macro whybroken_fq_table(database, schema, table_name) %}
-  {% if target.type == 'bigquery' %}
-    {{ return(database ~ '.' ~ schema ~ '.' ~ table_name) }}
-  {% elif target.type == 'databricks' %}
-    {{ return(database ~ '.' ~ schema ~ '.' ~ table_name) }}
-  {% elif target.type == 'snowflake' %}
+  {% if target.type in ('bigquery', 'databricks', 'spark', 'snowflake') %}
     {{ return(database ~ '.' ~ schema ~ '.' ~ table_name) }}
   {% else %}
     {{ return(schema ~ '.' ~ table_name) }}
@@ -88,28 +80,13 @@
 
 {% macro whybroken_get_columns_query(database, schema, table_name) %}
   {% if target.type == 'bigquery' %}
-    SELECT column_name, data_type
-    FROM {{ database }}.{{ schema }}.INFORMATION_SCHEMA.COLUMNS
-    WHERE table_name = '{{ table_name }}'
-    ORDER BY ordinal_position
-  {% elif target.type == 'databricks' %}
-    SELECT column_name, data_type
-    FROM {{ database }}.information_schema.columns
-    WHERE table_schema = '{{ schema }}'
-      AND table_name = '{{ table_name }}'
-    ORDER BY ordinal_position
+    {{ return("SELECT column_name, data_type FROM " ~ database ~ "." ~ schema ~ ".INFORMATION_SCHEMA.COLUMNS WHERE table_name = '" ~ table_name ~ "' ORDER BY ordinal_position") }}
+  {% elif target.type in ('databricks', 'spark') %}
+    {{ return("SELECT column_name, data_type FROM " ~ database ~ ".information_schema.columns WHERE table_schema = '" ~ schema ~ "' AND table_name = '" ~ table_name ~ "' ORDER BY ordinal_position") }}
   {% elif target.type == 'snowflake' %}
-    SELECT column_name, data_type
-    FROM {{ database }}.information_schema.columns
-    WHERE table_schema = UPPER('{{ schema }}')
-      AND table_name = UPPER('{{ table_name }}')
-    ORDER BY ordinal_position
+    {{ return("SELECT column_name, data_type FROM " ~ database ~ ".information_schema.columns WHERE table_schema = UPPER('" ~ schema ~ "') AND table_name = UPPER('" ~ table_name ~ "') ORDER BY ordinal_position") }}
   {% else %}
-    SELECT column_name, data_type
-    FROM information_schema.columns
-    WHERE table_schema = '{{ schema }}'
-      AND table_name = '{{ table_name }}'
-    ORDER BY ordinal_position
+    {{ return("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = '" ~ schema ~ "' AND table_name = '" ~ table_name ~ "' ORDER BY ordinal_position") }}
   {% endif %}
 {% endmacro %}
 
@@ -119,17 +96,12 @@
 {# ------------------------------------------------------------------ #}
 
 {% macro whybroken_is_numeric(col_type) %}
-  {% set numeric_types = [
-    'INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT',
-    'FLOAT', 'DOUBLE', 'DECIMAL', 'NUMERIC', 'REAL',
-    'FLOAT64', 'INT64', 'NUMERIC', 'BIGNUMERIC',
-    'NUMBER', 'LONG', 'SHORT',
-  ] %}
-  {% set ct = col_type | upper %}
-  {% for nt in numeric_types %}
-    {% if ct == nt or ct.startswith(nt ~ '(') or ct.startswith('DECIMAL') or ct.startswith('NUMBER') or ct.startswith('NUMERIC') %}
-      {{ return(true) }}
-    {% endif %}
-  {% endfor %}
-  {{ return(false) }}
+  {% set ct = col_type | upper | trim %}
+  {% if ct in ('INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'FLOAT', 'DOUBLE', 'REAL', 'FLOAT64', 'INT64', 'BIGNUMERIC', 'LONG', 'SHORT') %}
+    {{ return(true) }}
+  {% elif ct.startswith('DECIMAL') or ct.startswith('NUMERIC') or ct.startswith('NUMBER') %}
+    {{ return(true) }}
+  {% else %}
+    {{ return(false) }}
+  {% endif %}
 {% endmacro %}
