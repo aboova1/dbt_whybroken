@@ -6,7 +6,7 @@
   {% set avg_value_critical = var('whybroken_avg_value_critical', 80) %}
   {% set avg_value_high = var('whybroken_avg_value_high', 50) %}
   {% set null_spike_threshold = var('whybroken_null_spike_threshold', 10) %}
-  {% set fail_on_critical = var('whybroken_fail_on_critical', false) %}
+  {% set fail_on_critical = var('whybroken_fail_on_critical', true) %}
 
   {% set wb_schema = whybroken.whybroken_fq_schema() %}
   {% set ts = whybroken.whybroken_current_timestamp() %}
@@ -91,16 +91,6 @@
   {% endset %}
   {% do run_query(col_anomaly_query) %}
 
-  {% if fail_on_critical %}
-    {% set critical_check %}
-      SELECT COUNT(*) AS cnt FROM {{ wb_schema }}.whybroken_anomalies
-      WHERE run_id = '{{ run_id }}' AND severity = 'critical'
-    {% endset %}
-    {% set critical_results = run_query(critical_check) %}
-    {% if critical_results and critical_results.rows[0][0] > 0 %}
-      {{ exceptions.raise_compiler_error("WhyBroken: Critical anomalies detected! Run whybroken.whybroken_show_anomalies() for details.") }}
-    {% endif %}
-  {% endif %}
 
 {% endmacro %}
 

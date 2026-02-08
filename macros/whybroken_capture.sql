@@ -166,10 +166,21 @@
     {% endfor %}
 
     {{ log("", info=True) }}
+    {% if var('whybroken_fail_on_critical', true) and critical_count | length > 0 %}
+      {{ log(">>> This run will FAIL because critical anomalies were found.", info=True) }}
+      {{ log(">>> To disable auto-fail, set in dbt_project.yml:", info=True) }}
+      {{ log(">>>   vars:", info=True) }}
+      {{ log(">>>     whybroken_fail_on_critical: false", info=True) }}
+    {% endif %}
+    {{ log("", info=True) }}
     {{ log("Run `dbt run-operation whybroken.whybroken_show_anomalies` for full details.", info=True) }}
     {{ log("", info=True) }}
   {% endif %}
 
   {{ log("WhyBroken: captured " ~ (successful_models | length) ~ " models", info=True) }}
+
+  {% if var('whybroken_fail_on_critical', true) and critical_count | length > 0 %}
+    {{ exceptions.raise_compiler_error("WhyBroken: CRITICAL anomalies detected. See alert details above. To disable auto-fail, add to dbt_project.yml: vars: {whybroken_fail_on_critical: false}") }}
+  {% endif %}
 
 {% endmacro %}
