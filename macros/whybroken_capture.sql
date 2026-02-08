@@ -1,31 +1,47 @@
-{% macro whybroken_create_tracking_tables() %}
+{% macro whybroken_create_baseline_table() %}
 
   {% set wb_schema = whybroken.whybroken_fq_schema() %}
   {% set s = whybroken.whybroken_type_string() %}
-  {% set i = whybroken.whybroken_type_int() %}
   {% set bi = whybroken.whybroken_type_bigint() %}
   {% set f = whybroken.whybroken_type_float() %}
   {% set t = whybroken.whybroken_type_timestamp() %}
 
   {% do run_query("CREATE SCHEMA IF NOT EXISTS " ~ wb_schema) %}
 
-  {% do run_query("CREATE TABLE IF NOT EXISTS " ~ wb_schema ~ ".whybroken_runs (run_id " ~ s ~ ", started_at " ~ t ~ ", model_count " ~ i ~ ", dbt_version " ~ s ~ ")") %}
-  {% do run_query("CREATE TABLE IF NOT EXISTS " ~ wb_schema ~ ".whybroken_snapshots (run_id " ~ s ~ ", model_name " ~ s ~ ", row_count " ~ bi ~ ", column_count " ~ i ~ ", captured_at " ~ t ~ ")") %}
-  {% do run_query("CREATE TABLE IF NOT EXISTS " ~ wb_schema ~ ".whybroken_column_stats (run_id " ~ s ~ ", model_name " ~ s ~ ", column_name " ~ s ~ ", null_count " ~ bi ~ ", distinct_count " ~ bi ~ ", min_value " ~ s ~ ", max_value " ~ s ~ ", avg_value " ~ f ~ ", captured_at " ~ t ~ ")") %}
-  {% do run_query("CREATE TABLE IF NOT EXISTS " ~ wb_schema ~ ".whybroken_anomalies (run_id " ~ s ~ ", model_name " ~ s ~ ", anomaly_type " ~ s ~ ", column_name " ~ s ~ ", severity " ~ s ~ ", description " ~ s ~ ", current_value " ~ s ~ ", previous_value " ~ s ~ ", delta_pct " ~ f ~ ", detected_at " ~ t ~ ")") %}
+  {% do run_query(
+    "CREATE TABLE IF NOT EXISTS " ~ wb_schema ~ ".whybroken_baseline ("
+    ~ "model_name " ~ s ~ ", "
+    ~ "row_count " ~ bi ~ ", "
+    ~ "column_count " ~ bi ~ ", "
+    ~ "column_name " ~ s ~ ", "
+    ~ "null_count " ~ bi ~ ", "
+    ~ "distinct_count " ~ bi ~ ", "
+    ~ "min_value " ~ s ~ ", "
+    ~ "max_value " ~ s ~ ", "
+    ~ "avg_value " ~ f ~ ", "
+    ~ "captured_at " ~ t
+    ~ ")"
+  ) %}
 
 {% endmacro %}
 
 
 {% macro whybroken_capture() %}
 
-  {{ whybroken.whybroken_create_tracking_tables() }}
+  {{ whybroken.whybroken_create_baseline_table() }}
 
   {% set wb_schema = whybroken.whybroken_fq_schema() %}
-  {% set run_id = invocation_id %}
   {% set ts = whybroken.whybroken_current_timestamp() %}
   {% set str_type = whybroken.whybroken_type_string() %}
   {% set float_type = whybroken.whybroken_type_float() %}
+
+  {% set row_count_threshold = var('whybroken_row_count_threshold', 50) %}
+  {% set row_count_critical = var('whybroken_row_count_critical', 100) %}
+  {% set avg_value_threshold = var('whybroken_avg_value_threshold', 30) %}
+  {% set avg_value_critical = var('whybroken_avg_value_critical', 80) %}
+  {% set avg_value_high = var('whybroken_avg_value_high', 50) %}
+  {% set null_spike_threshold = var('whybroken_null_spike_threshold', 10) %}
+  {% set fail_on_critical = var('whybroken_fail_on_critical', true) %}
 
   {% set successful_models = results | selectattr('node.resource_type', 'equalto', 'model') | selectattr('status', 'equalto', 'success') | list %}
 
@@ -33,7 +49,7 @@
     {{ return('') }}
   {% endif %}
 
-  {% do run_query("INSERT INTO " ~ wb_schema ~ ".whybroken_runs (run_id, started_at, model_count, dbt_version) VALUES ('" ~ run_id ~ "', " ~ ts ~ ", " ~ (successful_models | length) ~ ", '" ~ dbt_version ~ "')") %}
+  {% set all_anomalies = [] %}
 
   {% for result in successful_models %}
     {% set model_name = result.node.name %}
@@ -47,9 +63,38 @@
     {% set col_count = col_data.rows | length %}
 
     {% set count_result = run_query("SELECT COUNT(*) FROM " ~ fqn) %}
-    {% set row_count = count_result.columns[0].values()[0] %}
+    {% set row_count = count_result.columns[0].values()[0] | float %}
 
-    {% do run_query("INSERT INTO " ~ wb_schema ~ ".whybroken_snapshots (run_id, model_name, row_count, column_count, captured_at) VALUES ('" ~ run_id ~ "', '" ~ model_name ~ "', " ~ row_count ~ ", " ~ col_count ~ ", " ~ ts ~ ")") %}
+    {% set prev_baseline = run_query(
+      "SELECT column_name, row_count, null_count, distinct_count, min_value, max_value, avg_value "
+      ~ "FROM " ~ wb_schema ~ ".whybroken_baseline "
+      ~ "WHERE model_name = '" ~ model_name ~ "'"
+    ) %}
+
+    {% set prev_map = {} %}
+    {% for prow in prev_baseline.rows %}
+      {% do prev_map.update({prow[0]: {'row_count': prow[1] | float, 'null_count': prow[2] | float if prow[2] is not none else none, 'distinct_count': prow[3], 'min_value': prow[4], 'max_value': prow[5], 'avg_value': prow[6] | float if prow[6] is not none else none}}) %}
+    {% endfor %}
+
+    {% if '*' in prev_map %}
+      {% set prev_row_count = prev_map['*']['row_count'] %}
+      {% if prev_row_count is not none and prev_row_count > 0 %}
+        {% set row_delta = ((row_count - prev_row_count) * 100.0 / prev_row_count) %}
+        {% if row_delta | abs > row_count_threshold %}
+          {% set row_sev = 'critical' if row_delta | abs > row_count_critical else 'high' %}
+          {% do all_anomalies.append({
+            'severity': row_sev,
+            'model': model_name,
+            'type': 'row_count_change',
+            'column': '*',
+            'description': 'Row count changed by ' ~ (row_delta | round(1)) ~ '% (' ~ prev_row_count | int ~ ' -> ' ~ row_count | int ~ ')',
+            'current': row_count | int | string,
+            'previous': prev_row_count | int | string,
+            'delta': row_delta
+          }) %}
+        {% endif %}
+      {% endif %}
+    {% endif %}
 
     {% set stat_selects = [] %}
     {% for row in col_data.rows %}
@@ -84,11 +129,68 @@
     {% if stat_selects | length > 0 %}
       {% set stats_result = run_query(stat_selects | join(" UNION ALL ")) %}
 
-      {% set stat_values = [] %}
       {% for srow in stats_result.rows %}
-        {% do stat_values.append(
-          "('" ~ run_id ~ "', '"
-          ~ model_name ~ "', '"
+        {% set col_name = srow[0] %}
+        {% set cur_null = srow[1] | float if srow[1] is not none else none %}
+        {% set cur_avg = srow[5] | float if srow[5] is not none else none %}
+
+        {% if col_name in prev_map %}
+          {% set prev = prev_map[col_name] %}
+          {% set prev_null = prev['null_count'] %}
+          {% set prev_avg = prev['avg_value'] %}
+
+          {% if cur_avg is not none and prev_avg is not none and prev_avg != 0 %}
+            {% set avg_delta = ((cur_avg - prev_avg) * 100.0 / (prev_avg | abs)) %}
+            {% if avg_delta | abs > avg_value_threshold %}
+              {% if avg_delta | abs > avg_value_critical %}
+                {% set avg_sev = 'critical' %}
+              {% elif avg_delta | abs > avg_value_high %}
+                {% set avg_sev = 'high' %}
+              {% else %}
+                {% set avg_sev = 'medium' %}
+              {% endif %}
+              {% do all_anomalies.append({
+                'severity': avg_sev,
+                'model': model_name,
+                'type': 'avg_value_change',
+                'column': col_name,
+                'description': 'Average of ' ~ col_name ~ ' changed by ' ~ (avg_delta | round(1)) ~ '% (' ~ (prev_avg | round(2)) ~ ' -> ' ~ (cur_avg | round(2)) ~ ')',
+                'current': cur_avg | string,
+                'previous': prev_avg | string,
+                'delta': avg_delta
+              }) %}
+            {% endif %}
+          {% endif %}
+
+          {% if prev_null is not none and cur_null is not none and cur_null > prev_null and (cur_null - prev_null) > null_spike_threshold %}
+            {% do all_anomalies.append({
+              'severity': 'high',
+              'model': model_name,
+              'type': 'null_spike',
+              'column': col_name,
+              'description': 'Null count for ' ~ col_name ~ ' increased from ' ~ prev_null ~ ' to ' ~ cur_null,
+              'current': cur_null | string,
+              'previous': prev_null | string,
+              'delta': ((cur_null - prev_null) * 100.0 / prev_null) if prev_null > 0 else 100.0
+            }) %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+
+    {% do run_query(
+      "DELETE FROM " ~ wb_schema ~ ".whybroken_baseline WHERE model_name = '" ~ model_name ~ "'"
+    ) %}
+
+    {% set baseline_values = [] %}
+    {% do baseline_values.append(
+      "('" ~ model_name ~ "', " ~ row_count ~ ", " ~ col_count ~ ", '*', NULL, NULL, NULL, NULL, NULL, " ~ ts ~ ")"
+    ) %}
+
+    {% if stat_selects | length > 0 %}
+      {% for srow in stats_result.rows %}
+        {% do baseline_values.append(
+          "('" ~ model_name ~ "', " ~ row_count ~ ", " ~ col_count ~ ", '"
           ~ srow[0] ~ "', "
           ~ srow[1] | string ~ ", "
           ~ srow[2] | string ~ ", '"
@@ -98,29 +200,29 @@
           ~ ts ~ ")"
         ) %}
       {% endfor %}
-      {% do run_query("INSERT INTO " ~ wb_schema ~ ".whybroken_column_stats (run_id, model_name, column_name, null_count, distinct_count, min_value, max_value, avg_value, captured_at) VALUES " ~ (stat_values | join(", "))) %}
     {% endif %}
+
+    {% do run_query(
+      "INSERT INTO " ~ wb_schema ~ ".whybroken_baseline "
+      ~ "(model_name, row_count, column_count, column_name, null_count, distinct_count, min_value, max_value, avg_value, captured_at) "
+      ~ "VALUES " ~ (baseline_values | join(", "))
+    ) %}
   {% endfor %}
 
-  {{ whybroken.whybroken_detect_anomalies_batch(run_id) }}
-
-  {% set anomaly_results = run_query(
-    "SELECT severity, model_name, anomaly_type, column_name, current_value, previous_value, delta_pct, description "
-    ~ "FROM " ~ wb_schema ~ ".whybroken_anomalies "
-    ~ "WHERE run_id = '" ~ run_id ~ "' "
-    ~ "ORDER BY CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END"
-  ) %}
-
-  {% set anomaly_rows = anomaly_results.rows | list %}
   {% set critical_count = [] %}
   {% set high_count = [] %}
   {% set medium_count = [] %}
-  {% for arow in anomaly_rows %}
-    {% if arow[0] == 'critical' %}{% do critical_count.append(1) %}{% endif %}
-    {% if arow[0] == 'high' %}{% do high_count.append(1) %}{% endif %}
-    {% if arow[0] == 'medium' %}{% do medium_count.append(1) %}{% endif %}
+  {% for a in all_anomalies %}
+    {% if a.severity == 'critical' %}{% do critical_count.append(1) %}{% endif %}
+    {% if a.severity == 'high' %}{% do high_count.append(1) %}{% endif %}
+    {% if a.severity == 'medium' %}{% do medium_count.append(1) %}{% endif %}
   {% endfor %}
-  {% set total_count = anomaly_rows | length %}
+  {% set total_count = all_anomalies | length %}
+
+  {% set sorted_anomalies = [] %}
+  {% for a in all_anomalies %}{% if a.severity == 'critical' %}{% do sorted_anomalies.append(a) %}{% endif %}{% endfor %}
+  {% for a in all_anomalies %}{% if a.severity == 'high' %}{% do sorted_anomalies.append(a) %}{% endif %}{% endfor %}
+  {% for a in all_anomalies %}{% if a.severity == 'medium' %}{% do sorted_anomalies.append(a) %}{% endif %}{% endfor %}
 
   {% if total_count == 0 %}
     {{ log("", info=True) }}
@@ -138,48 +240,37 @@
     {{ log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", info=True) }}
     {{ log("", info=True) }}
 
-    {% for arow in anomaly_rows %}
-      {% set sev = arow[0] | upper %}
-      {% set model = arow[1] %}
-      {% set anom_type = arow[2] %}
-      {% set col = arow[3] %}
-      {% set curr = arow[4] %}
-      {% set prev = arow[5] %}
-      {% set delta = arow[6] %}
-      {% set desc = arow[7] %}
-
-      {% if sev == 'CRITICAL' %}
+    {% for a in sorted_anomalies %}
+      {% if a.severity == 'critical' %}
         {% set marker = "[CRITICAL]" %}
-      {% elif sev == 'HIGH' %}
+      {% elif a.severity == 'high' %}
         {% set marker = "[HIGH]    " %}
       {% else %}
         {% set marker = "[MEDIUM]  " %}
       {% endif %}
 
-      {% if anom_type == 'row_count_change' %}
-        {{ log(marker ~ "  " ~ model ~ "  >>  Row count shifted " ~ (delta | round(1)) ~ "% (was " ~ prev ~ ", now " ~ curr ~ ")", info=True) }}
-      {% elif col is not none and col != '' and col != '*' %}
-        {{ log(marker ~ "  " ~ model ~ "." ~ col ~ "  >>  " ~ desc, info=True) }}
+      {% if a.type == 'row_count_change' %}
+        {{ log(marker ~ "  " ~ a.model ~ "  >>  " ~ a.description, info=True) }}
+      {% elif a.column is not none and a.column != '' and a.column != '*' %}
+        {{ log(marker ~ "  " ~ a.model ~ "." ~ a.column ~ "  >>  " ~ a.description, info=True) }}
       {% else %}
-        {{ log(marker ~ "  " ~ model ~ "  >>  " ~ desc, info=True) }}
+        {{ log(marker ~ "  " ~ a.model ~ "  >>  " ~ a.description, info=True) }}
       {% endif %}
     {% endfor %}
 
     {{ log("", info=True) }}
-    {% if var('whybroken_fail_on_critical', true) and critical_count | length > 0 %}
+    {% if fail_on_critical and critical_count | length > 0 %}
       {{ log(">>> This run will FAIL because critical anomalies were found.", info=True) }}
       {{ log(">>> To disable auto-fail, set in dbt_project.yml:", info=True) }}
       {{ log(">>>   vars:", info=True) }}
       {{ log(">>>     whybroken_fail_on_critical: false", info=True) }}
+      {{ log("", info=True) }}
     {% endif %}
-    {{ log("", info=True) }}
-    {{ log("Run `dbt run-operation whybroken.whybroken_show_anomalies` for full details.", info=True) }}
-    {{ log("", info=True) }}
   {% endif %}
 
   {{ log("WhyBroken: captured " ~ (successful_models | length) ~ " models", info=True) }}
 
-  {% if var('whybroken_fail_on_critical', true) and critical_count | length > 0 %}
+  {% if fail_on_critical and critical_count | length > 0 %}
     {{ exceptions.raise_compiler_error("WhyBroken: CRITICAL anomalies detected. See alert details above. To disable auto-fail, add to dbt_project.yml: vars: {whybroken_fail_on_critical: false}") }}
   {% endif %}
 
