@@ -102,6 +102,48 @@
 
   {{ whybroken.whybroken_detect_anomalies_batch(run_id) }}
 
+  {% set anomaly_results = run_query(
+    "SELECT severity, model_name, anomaly_type, column_name, current_value, previous_value, delta_pct "
+    ~ "FROM " ~ wb_schema ~ ".whybroken_anomalies "
+    ~ "WHERE run_id = '" ~ run_id ~ "' "
+    ~ "ORDER BY CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END"
+  ) %}
+
+  {% set anomaly_rows = anomaly_results.rows | list %}
+  {% set critical_count = anomaly_rows | selectattr(0, 'equalto', 'critical') | list | length %}
+  {% set high_count = anomaly_rows | selectattr(0, 'equalto', 'high') | list | length %}
+  {% set medium_count = anomaly_rows | selectattr(0, 'equalto', 'medium') | list | length %}
+  {% set total_count = anomaly_rows | length %}
+
+  {% if total_count == 0 %}
+    {{ log("WhyBroken: 0 anomalies detected", info=True) }}
+  {% else %}
+    {% set parts = [] %}
+    {% if critical_count > 0 %}{% do parts.append(critical_count ~ " critical") %}{% endif %}
+    {% if high_count > 0 %}{% do parts.append(high_count ~ " high") %}{% endif %}
+    {% if medium_count > 0 %}{% do parts.append(medium_count ~ " medium") %}{% endif %}
+    {{ log("WhyBroken WARNING: " ~ total_count ~ " anomalies detected (" ~ parts | join(", ") ~ ")", info=True) }}
+
+    {% for arow in anomaly_rows %}
+      {% if arow[0] == 'critical' or arow[0] == 'high' %}
+        {% set sev_label = arow[0] | upper %}
+        {% set model = arow[1] %}
+        {% set anom_type = arow[2] %}
+        {% set col = arow[3] %}
+        {% set curr = arow[4] %}
+        {% set prev = arow[5] %}
+        {% set delta = arow[6] %}
+        {% if anom_type == 'row_count' %}
+          {{ log("WhyBroken " ~ sev_label ~ ": " ~ model ~ " — Row count changed by " ~ (delta | round(1)) ~ "% (" ~ prev ~ " -> " ~ curr ~ ")", info=True) }}
+        {% elif col is not none and col != '' %}
+          {{ log("WhyBroken " ~ sev_label ~ ": " ~ model ~ " — " ~ anom_type | replace("_", " ") | capitalize ~ " of " ~ col ~ " changed by " ~ (delta | round(1)) ~ "% (" ~ prev ~ " -> " ~ curr ~ ")", info=True) }}
+        {% else %}
+          {{ log("WhyBroken " ~ sev_label ~ ": " ~ model ~ " — " ~ anom_type | replace("_", " ") | capitalize ~ " changed by " ~ (delta | round(1)) ~ "% (" ~ prev ~ " -> " ~ curr ~ ")", info=True) }}
+        {% endif %}
+      {% endif %}
+    {% endfor %}
+  {% endif %}
+
   {{ log("WhyBroken: captured " ~ (successful_models | length) ~ " models", info=True) }}
 
 {% endmacro %}
