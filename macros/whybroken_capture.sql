@@ -49,7 +49,30 @@
     {{ return('') }}
   {% endif %}
 
+  {% set all_prev %}
+    SELECT model_name, column_name, row_count, null_count, distinct_count, min_value, max_value, avg_value
+    FROM {{ wb_schema }}.whybroken_baseline
+  {% endset %}
+  {% set all_prev = run_query(all_prev) %}
+
+  {% set prev_data = {} %}
+  {% for prow in all_prev.rows %}
+    {% set mname = prow[0] %}
+    {% if mname not in prev_data %}
+      {% do prev_data.update({mname: {}}) %}
+    {% endif %}
+    {% do prev_data[mname].update({prow[1]: {
+      'row_count': prow[2] | float if prow[2] is not none else none,
+      'null_count': prow[3] | float if prow[3] is not none else none,
+      'distinct_count': prow[4],
+      'min_value': prow[5],
+      'max_value': prow[6],
+      'avg_value': prow[7] | float if prow[7] is not none else none
+    }}) %}
+  {% endfor %}
+
   {% set all_anomalies = [] %}
+  {% set all_baseline_values = [] %}
 
   {% for result in successful_models %}
     {% set model_name = result.node.name %}
@@ -62,19 +85,36 @@
     {% set col_data = run_query(col_query) %}
     {% set col_count = col_data.rows | length %}
 
-    {% set count_result = run_query("SELECT COUNT(*) FROM " ~ fqn) %}
-    {% set row_count = count_result.columns[0].values()[0] | float %}
+    {% set stat_parts = [] %}
+    {% set col_names = [] %}
+    {% for row in col_data.rows %}
+      {% set col_name = row[0] %}
+      {% set col_type = row[1] %}
+      {% set qcol = adapter.quote(col_name) %}
+      {% set is_num = whybroken.whybroken_is_numeric(col_type | string | upper) %}
+      {% do col_names.append({'name': col_name, 'is_numeric': is_num}) %}
 
-    {% set prev_baseline = run_query(
-      "SELECT column_name, row_count, null_count, distinct_count, min_value, max_value, avg_value "
-      ~ "FROM " ~ wb_schema ~ ".whybroken_baseline "
-      ~ "WHERE model_name = '" ~ model_name ~ "'"
-    ) %}
-
-    {% set prev_map = {} %}
-    {% for prow in prev_baseline.rows %}
-      {% do prev_map.update({prow[0]: {'row_count': prow[1] | float, 'null_count': prow[2] | float if prow[2] is not none else none, 'distinct_count': prow[3], 'min_value': prow[4], 'max_value': prow[5], 'avg_value': prow[6] | float if prow[6] is not none else none}}) %}
+      {% do stat_parts.append("COUNT(*) - COUNT(" ~ qcol ~ ")") %}
+      {% do stat_parts.append("COUNT(DISTINCT " ~ qcol ~ ")") %}
+      {% do stat_parts.append("CAST(MIN(" ~ qcol ~ ") AS " ~ str_type ~ ")") %}
+      {% do stat_parts.append("CAST(MAX(" ~ qcol ~ ") AS " ~ str_type ~ ")") %}
+      {% if is_num %}
+        {% do stat_parts.append("CAST(AVG(CAST(" ~ qcol ~ " AS " ~ float_type ~ ")) AS " ~ float_type ~ ")") %}
+      {% else %}
+        {% do stat_parts.append("CAST(NULL AS " ~ float_type ~ ")") %}
+      {% endif %}
     {% endfor %}
+
+    {% if col_names | length == 0 %}
+      {% set stats_query = "SELECT COUNT(*) FROM " ~ fqn %}
+    {% else %}
+      {% set stats_query = "SELECT COUNT(*), " ~ stat_parts | join(", ") ~ " FROM " ~ fqn %}
+    {% endif %}
+    {% set stats_result = run_query(stats_query) %}
+    {% set srow = stats_result.rows[0] %}
+    {% set row_count = srow[0] | float %}
+
+    {% set prev_map = prev_data[model_name] if model_name in prev_data else {} %}
 
     {% if '*' in prev_map %}
       {% set prev_row_count = prev_map['*']['row_count'] %}
@@ -87,125 +127,87 @@
             'model': model_name,
             'type': 'row_count_change',
             'column': '*',
-            'description': 'Row count changed by ' ~ (row_delta | round(1)) ~ '% (' ~ prev_row_count | int ~ ' -> ' ~ row_count | int ~ ')',
-            'current': row_count | int | string,
-            'previous': prev_row_count | int | string,
-            'delta': row_delta
+            'description': 'Row count changed by ' ~ (row_delta | round(1)) ~ '% (' ~ prev_row_count | int ~ ' -> ' ~ row_count | int ~ ')'
           }) %}
         {% endif %}
       {% endif %}
     {% endif %}
 
-    {% set stat_selects = [] %}
-    {% for row in col_data.rows %}
-      {% set col_name = row[0] %}
-      {% set col_type = row[1] %}
-      {% set qcol = adapter.quote(col_name) %}
-      {% set is_num = whybroken.whybroken_is_numeric(col_type | string | upper) %}
+    {% do all_baseline_values.append(
+      "('" ~ model_name ~ "', " ~ row_count | int ~ ", " ~ col_count ~ ", '*', NULL, NULL, NULL, NULL, NULL, " ~ ts ~ ")"
+    ) %}
 
-      {% if is_num %}
-        {% do stat_selects.append(
-          "SELECT '" ~ col_name ~ "', "
-          ~ "COUNT(*) - COUNT(" ~ qcol ~ "), "
-          ~ "COUNT(DISTINCT " ~ qcol ~ "), "
-          ~ "CAST(MIN(" ~ qcol ~ ") AS " ~ str_type ~ "), "
-          ~ "CAST(MAX(" ~ qcol ~ ") AS " ~ str_type ~ "), "
-          ~ "CAST(AVG(CAST(" ~ qcol ~ " AS " ~ float_type ~ ")) AS " ~ float_type ~ ") "
-          ~ "FROM " ~ fqn
-        ) %}
-      {% else %}
-        {% do stat_selects.append(
-          "SELECT '" ~ col_name ~ "', "
-          ~ "COUNT(*) - COUNT(" ~ qcol ~ "), "
-          ~ "COUNT(DISTINCT " ~ qcol ~ "), "
-          ~ "CAST(MIN(" ~ qcol ~ ") AS " ~ str_type ~ "), "
-          ~ "CAST(MAX(" ~ qcol ~ ") AS " ~ str_type ~ "), "
-          ~ "CAST(NULL AS " ~ float_type ~ ") "
-          ~ "FROM " ~ fqn
-        ) %}
-      {% endif %}
-    {% endfor %}
+    {% for i in range(col_names | length) %}
+      {% set col_name = col_names[i]['name'] %}
+      {% set offset = 1 + (i * 5) %}
+      {% set cur_null = srow[offset] | float if srow[offset] is not none else none %}
+      {% set cur_distinct = srow[offset + 1] %}
+      {% set cur_min = srow[offset + 2] %}
+      {% set cur_max = srow[offset + 3] %}
+      {% set cur_avg = srow[offset + 4] | float if srow[offset + 4] is not none else none %}
 
-    {% if stat_selects | length > 0 %}
-      {% set stats_result = run_query(stat_selects | join(" UNION ALL ")) %}
+      {% if col_name in prev_map %}
+        {% set prev = prev_map[col_name] %}
+        {% set prev_null = prev['null_count'] %}
+        {% set prev_avg = prev['avg_value'] %}
 
-      {% for srow in stats_result.rows %}
-        {% set col_name = srow[0] %}
-        {% set cur_null = srow[1] | float if srow[1] is not none else none %}
-        {% set cur_avg = srow[5] | float if srow[5] is not none else none %}
-
-        {% if col_name in prev_map %}
-          {% set prev = prev_map[col_name] %}
-          {% set prev_null = prev['null_count'] %}
-          {% set prev_avg = prev['avg_value'] %}
-
-          {% if cur_avg is not none and prev_avg is not none and prev_avg != 0 %}
-            {% set avg_delta = ((cur_avg - prev_avg) * 100.0 / (prev_avg | abs)) %}
-            {% if avg_delta | abs > avg_value_threshold %}
-              {% if avg_delta | abs > avg_value_critical %}
-                {% set avg_sev = 'critical' %}
-              {% elif avg_delta | abs > avg_value_high %}
-                {% set avg_sev = 'high' %}
-              {% else %}
-                {% set avg_sev = 'medium' %}
-              {% endif %}
-              {% do all_anomalies.append({
-                'severity': avg_sev,
-                'model': model_name,
-                'type': 'avg_value_change',
-                'column': col_name,
-                'description': 'Average of ' ~ col_name ~ ' changed by ' ~ (avg_delta | round(1)) ~ '% (' ~ (prev_avg | round(2)) ~ ' -> ' ~ (cur_avg | round(2)) ~ ')',
-                'current': cur_avg | string,
-                'previous': prev_avg | string,
-                'delta': avg_delta
-              }) %}
+        {% if cur_avg is not none and prev_avg is not none and prev_avg != 0 %}
+          {% set avg_delta = ((cur_avg - prev_avg) * 100.0 / (prev_avg | abs)) %}
+          {% if avg_delta | abs > avg_value_threshold %}
+            {% if avg_delta | abs > avg_value_critical %}
+              {% set avg_sev = 'critical' %}
+            {% elif avg_delta | abs > avg_value_high %}
+              {% set avg_sev = 'high' %}
+            {% else %}
+              {% set avg_sev = 'medium' %}
             {% endif %}
-          {% endif %}
-
-          {% if prev_null is not none and cur_null is not none and cur_null > prev_null and (cur_null - prev_null) > null_spike_threshold %}
             {% do all_anomalies.append({
-              'severity': 'high',
+              'severity': avg_sev,
               'model': model_name,
-              'type': 'null_spike',
+              'type': 'avg_value_change',
               'column': col_name,
-              'description': 'Null count for ' ~ col_name ~ ' increased from ' ~ prev_null ~ ' to ' ~ cur_null,
-              'current': cur_null | string,
-              'previous': prev_null | string,
-              'delta': ((cur_null - prev_null) * 100.0 / prev_null) if prev_null > 0 else 100.0
+              'description': 'Average of ' ~ col_name ~ ' changed by ' ~ (avg_delta | round(1)) ~ '% (' ~ (prev_avg | round(2)) ~ ' -> ' ~ (cur_avg | round(2)) ~ ')'
             }) %}
           {% endif %}
         {% endif %}
-      {% endfor %}
-    {% endif %}
 
-    {% do run_query(
-      "DELETE FROM " ~ wb_schema ~ ".whybroken_baseline WHERE model_name = '" ~ model_name ~ "'"
-    ) %}
+        {% if prev_null is not none and cur_null is not none and cur_null > prev_null and (cur_null - prev_null) > null_spike_threshold %}
+          {% do all_anomalies.append({
+            'severity': 'high',
+            'model': model_name,
+            'type': 'null_spike',
+            'column': col_name,
+            'description': 'Null count for ' ~ col_name ~ ' increased from ' ~ prev_null | int ~ ' to ' ~ cur_null | int
+          }) %}
+        {% endif %}
+      {% endif %}
 
-    {% set baseline_values = [] %}
-    {% do baseline_values.append(
-      "('" ~ model_name ~ "', " ~ row_count ~ ", " ~ col_count ~ ", '*', NULL, NULL, NULL, NULL, NULL, " ~ ts ~ ")"
-    ) %}
+      {% do all_baseline_values.append(
+        "('" ~ model_name ~ "', " ~ row_count | int ~ ", " ~ col_count ~ ", '"
+        ~ col_name ~ "', "
+        ~ (srow[offset] | string if srow[offset] is not none else "NULL") ~ ", "
+        ~ (srow[offset + 1] | string if srow[offset + 1] is not none else "NULL") ~ ", '"
+        ~ (srow[offset + 2] | replace("'", "''") if srow[offset + 2] is not none else "") ~ "', '"
+        ~ (srow[offset + 3] | replace("'", "''") if srow[offset + 3] is not none else "") ~ "', "
+        ~ (srow[offset + 4] | string if srow[offset + 4] is not none else "NULL") ~ ", "
+        ~ ts ~ ")"
+      ) %}
+    {% endfor %}
+  {% endfor %}
 
-    {% if stat_selects | length > 0 %}
-      {% for srow in stats_result.rows %}
-        {% do baseline_values.append(
-          "('" ~ model_name ~ "', " ~ row_count ~ ", " ~ col_count ~ ", '"
-          ~ srow[0] ~ "', "
-          ~ srow[1] | string ~ ", "
-          ~ srow[2] | string ~ ", '"
-          ~ (srow[3] | replace("'", "''") if srow[3] is not none else "") ~ "', '"
-          ~ (srow[4] | replace("'", "''") if srow[4] is not none else "") ~ "', "
-          ~ (srow[5] | string if srow[5] is not none else "NULL") ~ ", "
-          ~ ts ~ ")"
-        ) %}
-      {% endfor %}
-    {% endif %}
+  {% set model_name_list = [] %}
+  {% for result in successful_models %}
+    {% do model_name_list.append("'" ~ result.node.name ~ "'") %}
+  {% endfor %}
+  {% do run_query("DELETE FROM " ~ wb_schema ~ ".whybroken_baseline WHERE model_name IN (" ~ model_name_list | join(', ') ~ ")") %}
 
+  {% set batch_size = 50 %}
+  {% for i in range(0, all_baseline_values | length, batch_size) %}
+    {% set batch = all_baseline_values[i:i + batch_size] %}
     {% do run_query(
       "INSERT INTO " ~ wb_schema ~ ".whybroken_baseline "
       ~ "(model_name, row_count, column_count, column_name, null_count, distinct_count, min_value, max_value, avg_value, captured_at) "
-      ~ "VALUES " ~ (baseline_values | join(", "))
+      ~ "VALUES " ~ (batch | join(", "))
     ) %}
   {% endfor %}
 
