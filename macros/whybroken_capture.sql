@@ -273,7 +273,34 @@
   {{ log("WhyBroken: captured " ~ (successful_models | length) ~ " models", info=True) }}
 
   {% if fail_on_critical and critical_count | length > 0 %}
-    {{ exceptions.raise_compiler_error("WhyBroken: CRITICAL anomalies detected. See alert details above. To disable auto-fail, add to dbt_project.yml: vars: {whybroken_fail_on_critical: false}") }}
+    {% set error_lines = [] %}
+    {% do error_lines.append("") %}
+    {% do error_lines.append("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!") %}
+    {% do error_lines.append("!!!  WhyBroken ALERT: " ~ total_count ~ " data anomalies detected") %}
+    {% do error_lines.append("!!!  Breakdown: " ~ parts | join(" / ")) %}
+    {% do error_lines.append("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!") %}
+    {% do error_lines.append("") %}
+    {% for a in sorted_anomalies %}
+      {% if a.severity == 'critical' %}
+        {% set m = "[CRITICAL]" %}
+      {% elif a.severity == 'high' %}
+        {% set m = "[HIGH]    " %}
+      {% else %}
+        {% set m = "[MEDIUM]  " %}
+      {% endif %}
+      {% if a.type == 'row_count_change' %}
+        {% do error_lines.append(m ~ "  " ~ a.model ~ "  >>  " ~ a.description) %}
+      {% elif a.column is not none and a.column != '' and a.column != '*' %}
+        {% do error_lines.append(m ~ "  " ~ a.model ~ "." ~ a.column ~ "  >>  " ~ a.description) %}
+      {% else %}
+        {% do error_lines.append(m ~ "  " ~ a.model ~ "  >>  " ~ a.description) %}
+      {% endif %}
+    {% endfor %}
+    {% do error_lines.append("") %}
+    {% do error_lines.append("To disable auto-fail, add to dbt_project.yml:") %}
+    {% do error_lines.append("  vars:") %}
+    {% do error_lines.append("    whybroken_fail_on_critical: false") %}
+    {{ exceptions.raise_compiler_error(error_lines | join("\n")) }}
   {% endif %}
 
 {% endmacro %}
